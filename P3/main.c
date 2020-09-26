@@ -20,7 +20,9 @@ unsigned int INDEX = 0;
 //xQueueHandle mem_queue;
 static char input_str[80];
 int SLAVE_ADDRESS = 0x50;
+int MESSAGE_COUNT = 0;
 xSemaphoreHandle mem_semaphore;
+xSemaphoreHandle cn_semaphore;
 
 /* Function Prototypes */
 static void prvSetupHardware( void );
@@ -53,7 +55,6 @@ int main( void )
 {
     prvSetupHardware();		/*  Configure hardware */
     
-    mem_semaphore = xSemaphoreCreateBinary();
     
     #if ( configUSE_TRACE_FACILITY == 1 )
         vTraceEnable(TRC_START); // Initialize and start recording
@@ -64,9 +65,15 @@ int main( void )
 
     xTaskCreate(heartbeat, "heartbeat", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(mem_write, "eeprom write", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+    LATBSET = LEDA; //Indicate that you can begin writing a message.
     //xTaskCreate(mem_read, "eeprom read", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
     
-    vTaskStartScheduler();	/*  Finally start the scheduler. */
+    // Create semaphore here. I trigger an exception if it is created anywhere else...
+    mem_semaphore = xSemaphoreCreateBinary();
+    cn_semaphore = xSemaphoreCreateBinary();
+    
+    /*  Finally start the scheduler. */
+    vTaskStartScheduler();
 
 /* Will only reach here if there is insufficient heap available to start
  *  the scheduler. */
@@ -117,11 +124,13 @@ static void heartbeat() {
 }
 
 void isr_uart() {
+    //Very neat non-blocking function from comm.c
     if(getstrU1(input_str, sizeof(input_str))) {
+        LATBCLR = LEDA; //Clear LEDA to indicate write process.
         putcU1('\n');
         xSemaphoreGiveFromISR(mem_semaphore, NULL);
         //xQueueSendToBack(mem_queue, input_str, 20);
-        LCD_puts(input_str);
+        //LCD_puts(input_str);
     }
     mU1RXClearIntFlag();
 }
@@ -139,7 +148,12 @@ static void mem_write() {
         //Disable interrupts
         mU1RXIntEnable(0);
         mU1RXIntEnable(0);
-        int err = I2CWriteEEPROM(SLAVE_ADDRESS, mem_addr, inbox, 80);
+        int err = I2CWriteEEPROM(SLAVE_ADDRESS, mem_addr, input_str, 80);
+        LATBSET = LEDA; //Reenable LEDA when write is complete.
+        MESSAGE_COUNT++;
+        if(err != 0) LCD_puts("Error on EEPROM WRITE");
+        err = I2CReadEEPROM(SLAVE_ADDRESS, mem_addr, inbox, 80);
+        LCD_puts(inbox);
         mU1RXIntEnable(1);
         mU1RXIntEnable(1);
     }
