@@ -13,16 +13,19 @@
 #include "I2C_EEPROM_LIB.h"
 #include "LCDlib.h"
 
+
+#define DEBOUNCE_TIME 20/portTICK_RATE_MS
 /*-----------------------------------------------------------*/
 
 /* Global Variables */
 unsigned int INDEX = 0;
-//xQueueHandle mem_queue;
 static char input_str[80];
 int SLAVE_ADDRESS = 0x50;
 int MESSAGE_COUNT = 0;
+int MEM_ADDRESS[5] = {0,80,160,240,320};
 xSemaphoreHandle mem_semaphore;
 xSemaphoreHandle cn_semaphore;
+xQueueHandle addr_queue;
 
 /* Function Prototypes */
 static void prvSetupHardware( void );
@@ -31,7 +34,7 @@ void isr_uart();
 /* Task Prototypes  */
 static void heartbeat();
 static void mem_write();
-//static void mem_read();
+static void mem_read();
 void __ISR(_UART1_VECTOR, IPL1) vUART_ISR_Wrapper(void);
 void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
 
@@ -61,12 +64,12 @@ int main( void )
         str = xTraceRegisterString("Channel");
     #endif
 
-    //mem_queue = xQueueCreate(5, 80*sizeof(char));
+    addr_queue = xQueueCreate(5, sizeof(int));
 
     xTaskCreate(heartbeat, "heartbeat", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(mem_write, "eeprom write", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
     LATBSET = LEDA; //Indicate that you can begin writing a message.
-    //xTaskCreate(mem_read, "eeprom read", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(mem_read, "eeprom read", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
     
     // Create semaphore here. I trigger an exception if it is created anywhere else...
     mem_semaphore = xSemaphoreCreateBinary();
@@ -106,7 +109,7 @@ static void prvSetupHardware( void )
     
     //BTN1 CN Int init.
 	mCNOpen(CN_ON, CN8_ENABLE, 0);
-	mCNSetIntPriority(1);
+	mCNSetIntPriority(2);
 	mCNSetIntSubPriority(0);
 	unsigned int dummy = PORTReadBits(IOPORT_G, BTN1);
 	mCNClearIntFlag();
@@ -136,26 +139,47 @@ void isr_uart() {
 }
 
 void isr_cn() {
-    
+    xSemaphoreGiveFromISR(cn_semaphore, NULL);
+    mCNIntEnable(0);
+    mCNClearIntFlag();
 }
 
 static void mem_write() {
     char inbox[80];
-    
-    int mem_addr = 0x0;
     while(1) {
         xSemaphoreTake(mem_semaphore, portMAX_DELAY);
         //Disable interrupts
         mU1RXIntEnable(0);
-        mU1RXIntEnable(0);
-        int err = I2CWriteEEPROM(SLAVE_ADDRESS, mem_addr, input_str, 80);
+        mCNIntEnable(0);
+        int err = I2CWriteEEPROM(SLAVE_ADDRESS, MEM_ADDRESS[MESSAGE_COUNT], input_str, 80);
+        xQueueSendToBack(addr_queue, &MEM_ADDRESS[MESSAGE_COUNT], 20);
         LATBSET = LEDA; //Reenable LEDA when write is complete.
         MESSAGE_COUNT++;
         if(err != 0) LCD_puts("Error on EEPROM WRITE");
-        err = I2CReadEEPROM(SLAVE_ADDRESS, mem_addr, inbox, 80);
-        LCD_puts(inbox);
+        else putsU1("Written String to EEPROM\n");
+        //err = I2CReadEEPROM(SLAVE_ADDRESS, mem_addr, inbox, 80);
+        //LCD_puts(inbox);
         mU1RXIntEnable(1);
-        mU1RXIntEnable(1);
+        mCNIntEnable(1);
+    }
+}
+
+static void mem_read() {
+    char inbox[80];
+    int read_address;
+    while(1) {
+        xSemaphoreTake(cn_semaphore, portMAX_DELAY);
+        if(MESSAGE_COUNT > 0) {
+            vTaskDelay(DEBOUNCE_TIME);
+            while((PORTG & BTN1) != 0);
+            vTaskDelay(DEBOUNCE_TIME);
+            xQueueReceive(addr_queue, &read_address, 20);
+            int err = I2CReadEEPROM(SLAVE_ADDRESS, read_address, inbox, 80);
+            LCD_puts(inbox);
+            MESSAGE_COUNT--;
+        }
+        mCNClearIntFlag();
+        mCNIntEnable(1);
     }
 }
 
@@ -178,6 +202,8 @@ void vApplicationMallocFailedHook( void )
 
 void vApplicationIdleHook( void )
 {
+    if(MESSAGE_COUNT == 0) LATBSET = LEDB;
+    else LATBCLR = LEDB;
 	/* vApplicationIdleHook() will only be called if configUSE_IDLE_HOOK is set
 	to 1 in FreeRTOSConfig.h.  It will be called on each iteration of the idle
 	task.  It is essential that code added to this hook function never attempts
