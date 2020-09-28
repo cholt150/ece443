@@ -15,19 +15,21 @@
 
 
 #define DEBOUNCE_TIME 20/portTICK_RATE_MS
+#define SLAVE_ADDRESS 0x50
 /*-----------------------------------------------------------*/
 
 /* Global Variables */
-unsigned int INDEX = 0;
 static char input_str[80];
-int SLAVE_ADDRESS = 0x50;
 int MESSAGE_COUNT = 0;
 int MEM_ADDRESS[5] = {0,80,160,240,320};
+
 xSemaphoreHandle mem_semaphore;
 xSemaphoreHandle cn_semaphore;
 xQueueHandle addr_queue;
+xQueueHandle btn_queue;
 
 /* Function Prototypes */
+static void prettyPrint(char* input);
 static void prvSetupHardware( void );
 void isr_uart();
 
@@ -65,11 +67,13 @@ int main( void )
     #endif
 
     addr_queue = xQueueCreate(5, sizeof(int));
+    btn_queue = xQueueCreate(5, sizeof(int));
 
     xTaskCreate(heartbeat, "heartbeat", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(mem_write, "eeprom write", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
-    LATBSET = LEDA; //Indicate that you can begin writing a message.
     xTaskCreate(mem_read, "eeprom read", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+    
+    LATBSET = LEDA; //Indicate that you can begin writing a message.
     
     // Create semaphore here. I trigger an exception if it is created anywhere else...
     mem_semaphore = xSemaphoreCreateBinary();
@@ -132,14 +136,14 @@ void isr_uart() {
         LATBCLR = LEDA; //Clear LEDA to indicate write process.
         putcU1('\n');
         xSemaphoreGiveFromISR(mem_semaphore, NULL);
-        //xQueueSendToBack(mem_queue, input_str, 20);
-        //LCD_puts(input_str);
     }
     mU1RXClearIntFlag();
 }
 
 void isr_cn() {
+    int send = 1;
     xSemaphoreGiveFromISR(cn_semaphore, NULL);
+//    xQueueSendToBack(btn_queue, &send, 20);
     mCNIntEnable(0);
     mCNClearIntFlag();
 }
@@ -151,14 +155,15 @@ static void mem_write() {
         //Disable interrupts
         mU1RXIntEnable(0);
         mCNIntEnable(0);
+        
+        //Write to the EEPROM
         int err = I2CWriteEEPROM(SLAVE_ADDRESS, MEM_ADDRESS[MESSAGE_COUNT], input_str, 80);
+        
+        //Enqueue the address
         xQueueSendToBack(addr_queue, &MEM_ADDRESS[MESSAGE_COUNT], 20);
         LATBSET = LEDA; //Reenable LEDA when write is complete.
         MESSAGE_COUNT++;
         if(err != 0) LCD_puts("Error on EEPROM WRITE");
-        else putsU1("Written String to EEPROM\n");
-        //err = I2CReadEEPROM(SLAVE_ADDRESS, mem_addr, inbox, 80);
-        //LCD_puts(inbox);
         mU1RXIntEnable(1);
         mCNIntEnable(1);
     }
@@ -167,8 +172,10 @@ static void mem_write() {
 static void mem_read() {
     char inbox[80];
     int read_address;
+    int dummy;
     while(1) {
         xSemaphoreTake(cn_semaphore, portMAX_DELAY);
+//        xQueueReceive(btn_queue, &dummy, portMAX_DELAY);
         if(MESSAGE_COUNT > 0) {
             vTaskDelay(DEBOUNCE_TIME);
             while((PORTG & BTN1) != 0);
@@ -180,6 +187,18 @@ static void mem_read() {
         }
         mCNClearIntFlag();
         mCNIntEnable(1);
+    }
+}
+
+static void prettyPrint(char *input) {
+    char line0[16];
+    char line1[16];
+    int start = 0;
+    int end = 0;
+    
+    while(input[end] != ' ') {
+        
+        end++;
     }
 }
 
