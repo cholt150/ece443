@@ -194,7 +194,7 @@ char ch;                /* Received new character */
 
 if( buf_len == 0 || eol)    /* Check for buffer full or end of line */
     {
-        *p = '\0';             /* add null terminate the string */
+        //*p = '\0';             /* add null terminate the string */
         eol = TRUE;
         return TRUE;            /* Set EOL flag */
     }

@@ -15,11 +15,12 @@
 
 
 #define DEBOUNCE_TIME 20/portTICK_RATE_MS
+#define ONE_SEC 1000/portTICK_RATE_MS
 #define SLAVE_ADDRESS 0x50
 /*-----------------------------------------------------------*/
 
 /* Global Variables */
-static char input_str[80];
+static char input_str[80] = {'\0'};
 int MESSAGE_COUNT = 0;
 int MEM_ADDRESS[5] = {0,80,160,240,320};
 
@@ -30,6 +31,8 @@ xQueueHandle btn_queue;
 
 /* Function Prototypes */
 static void prettyPrint(char* input);
+static void PrintLineOne(char *line);
+static void PrintLineTwo(char *line);
 static void prvSetupHardware( void );
 void isr_uart();
 
@@ -45,17 +48,6 @@ void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
     traceString str;
 #endif
 
-/* main Function Description ***************************************
- * SYNTAX:		int main( void );
- * KEYWORDS:		Initialize, create, tasks, scheduler
- * DESCRIPTION:         This is a typical RTOS set up function. Hardware is
- * 			initialized, tasks are created, and the scheduler is
- * 			started.
- * PARAMETERS:		None
- * RETURN VALUE:	Exit code - used for error handling
- * NOTES:		All three buttons are polled using the same code
- *                      for reading the buttons.
- * END DESCRIPTION *****************************************************/
 int main( void )
 {
     prvSetupHardware();		/*  Configure hardware */
@@ -126,7 +118,7 @@ static void prvSetupHardware( void )
 static void heartbeat() {
     while(1) {
         LATBINV = LEDC;
-        vTaskDelay(1000/portTICK_RATE_MS);
+        vTaskDelay(1/portTICK_RATE_MS);
     }
 }
 
@@ -135,7 +127,8 @@ void isr_uart() {
     if(getstrU1(input_str, sizeof(input_str))) {
         LATBCLR = LEDA; //Clear LEDA to indicate write process.
         putcU1('\n');
-        xSemaphoreGiveFromISR(mem_semaphore, NULL);
+        if(MESSAGE_COUNT == 5) putsU1("MEMORY FULL. TRY AGAIN LATER");
+        else xSemaphoreGiveFromISR(mem_semaphore, NULL);
     }
     mU1RXClearIntFlag();
 }
@@ -162,6 +155,10 @@ static void mem_write() {
         //Enqueue the address
         xQueueSendToBack(addr_queue, &MEM_ADDRESS[MESSAGE_COUNT], 20);
         LATBSET = LEDA; //Reenable LEDA when write is complete.
+        int i;
+        for(i=0;i<80;i++) {
+            input_str[i] = '\0';
+        }
         MESSAGE_COUNT++;
         if(err != 0) LCD_puts("Error on EEPROM WRITE");
         mU1RXIntEnable(1);
@@ -181,8 +178,13 @@ static void mem_read() {
             while((PORTG & BTN1) != 0);
             vTaskDelay(DEBOUNCE_TIME);
             xQueueReceive(addr_queue, &read_address, 20);
+            int i = 0;
+            for(i=0;i<80;i++) {
+                inbox[i] = '\0'; //Clear inbox values
+            }
             int err = I2CReadEEPROM(SLAVE_ADDRESS, read_address, inbox, 80);
-            LCD_puts(inbox);
+            
+            prettyPrint(inbox);
             MESSAGE_COUNT--;
         }
         mCNClearIntFlag();
@@ -191,14 +193,64 @@ static void mem_read() {
 }
 
 static void prettyPrint(char *input) {
-    char line0[16];
-    char line1[16];
-    int start = 0;
-    int end = 0;
+    int i,j;
+    char lines[12][16] = {'\0'};
+    int line_start = 0, line_end = 0;
+    int num_of_lines = 0;
     
-    while(input[end] != ' ') {
-        
-        end++;
+    int edge = 15;
+    int end_flag = 0;
+    //Description of algorithm:
+    //look at the edge of our 16 character window.
+    //If it is a space or carriage return, commit that window to memory in the 2d array
+    //If it is a space or carriage return, set variables to indicate edge of window.
+    //if not, look a space to the left, and repeat.
+    for(i = edge; i >= 0; i--) {
+        if(input[i] == ' ' || input[i] == '\r') {
+            line_end = i;
+            int k = 0;
+            for(j = line_start;j<line_end;j++){
+                lines[num_of_lines][k] = input[j];
+                k++;
+            }
+            line_start = i;
+            num_of_lines++;
+            i = line_start + 16;
+            if(end_flag>0) break;
+            if(input[i] == '\0' || i > 80) end_flag++; //Detect the end of the input string
+        }
+    }
+    //scroll through the array
+    writeLCD(LCDIR,0x01); //Clear LCD?
+    PrintLineOne(lines[0]);
+    vTaskDelay(ONE_SEC);
+    if(num_of_lines > 1){
+        for(j=1;j <= num_of_lines; j++) {
+            writeLCD(LCDIR,0x01);
+            PrintLineOne(lines[j]);
+            PrintLineTwo(lines[j-1]);
+            vTaskDelay(ONE_SEC);
+        }
+    }
+    PrintLineTwo("                ");
+    vTaskDelay(ONE_SEC);
+}
+
+static void PrintLineOne(char *line) {
+    writeLCD(LCDIR,(0x40+0x80)); //Set address of cursor to 0x40
+    while(*line)
+    {
+        LCD_putc(*line);
+        *line++;
+    }
+}
+
+static void PrintLineTwo(char *line) {
+    writeLCD(LCDIR,0x80); // set address of cursor to 0x00
+    while(*line)
+    {
+        LCD_putc(*line);
+        *line++;
     }
 }
 
