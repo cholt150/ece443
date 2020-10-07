@@ -9,10 +9,8 @@
 #include<stdio.h>
 #include<string.h>
 #include "CerebotMX7cK.h"
-#include "comm.h"
-#include "I2C_EEPROM_LIB.h"
 #include "LCDlib.h"
-
+#include "IR_SMBus.h"
 
 #define DEBOUNCE_TIME 20/portTICK_RATE_MS
 #define ONE_SEC 1000/portTICK_RATE_MS
@@ -20,14 +18,8 @@
 /*-----------------------------------------------------------*/
 
 /* Global Variables */
-static char input_str[80] = {'\0'};
-int MESSAGE_COUNT = 0;
-int MEM_ADDRESS[5] = {0,80,160,240,320};
 
-xSemaphoreHandle mem_semaphore;
-xSemaphoreHandle cn_semaphore;
-xQueueHandle addr_queue;
-xQueueHandle btn_queue;
+/* FreeRTOS elements */
 
 /* Function Prototypes */
 static void prettyPrint(char* input);
@@ -40,8 +32,8 @@ void isr_uart();
 static void heartbeat();
 static void mem_write();
 static void mem_read();
-void __ISR(_UART1_VECTOR, IPL1) vUART_ISR_Wrapper(void);
-void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
+//void __ISR(_UART1_VECTOR, IPL1) vUART_ISR_Wrapper(void);
+//void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
 
     
 #if ( configUSE_TRACE_FACILITY == 1 )
@@ -52,9 +44,17 @@ void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
 #endif
 
 int main( void )
-{
-    prvSetupHardware();		/*  Configure hardware */
+{   
     
+    prvSetupHardware();		/*  Configure hardware */
+    init_I2C2();
+    while(1) {
+        char str[16];
+        float F = readTemp();
+        sprintf(str, "Temp = %f", F);
+        LCD_puts(str);
+        hw_delay(1000);
+    }
     
     #if ( configUSE_TRACE_FACILITY == 1 )
         vTraceEnable(TRC_START); // Initialize and start recording
@@ -64,19 +64,10 @@ int main( void )
         read_trace = xTraceRegisterString("Message Read from EEPROM");
     #endif
 
-    addr_queue = xQueueCreate(5, sizeof(int));
-    btn_queue = xQueueCreate(5, sizeof(int));
 
-    xTaskCreate(heartbeat, "heartbeat", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
-    xTaskCreate(mem_write, "eeprom write", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
-    xTaskCreate(mem_read, "eeprom read", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
     
     LATBSET = LEDA; //Indicate that you can begin writing a message.
-    
-    // Create semaphore here. I trigger an exception if it is created anywhere else...
-    mem_semaphore = xSemaphoreCreateBinary();
-    cn_semaphore = xSemaphoreCreateBinary();
-    
+
     /*  Finally start the scheduler. */
     vTaskStartScheduler();
 
@@ -121,158 +112,7 @@ static void prvSetupHardware( void )
 }
 /*-----------------------------------------------------------*/
 
-static void heartbeat() {
-    while(1) {
-        #if ( configUSE_TRACE_FACILITY == 1 )
-            vTracePrint(heartbeat_trace, "I'm still alive");
-        #endif
-        LATBINV = LEDC;
-        vTaskDelay(1/portTICK_RATE_MS);
-    }
-}
 
-void isr_uart() {
-    //Very neat non-blocking function from comm.c
-    #if ( configUSE_TRACE_FACILITY == 1 )
-        vTracePrint(uart_isr_trace, "UART Interrupted");
-    #endif
-    if(getstrU1(input_str, sizeof(input_str))) {
-        LATBCLR = LEDA; //Clear LEDA to indicate write process.
-        putcU1('\n');
-        if(MESSAGE_COUNT == 5) putsU1("MEMORY FULL. TRY AGAIN LATER");
-        else xSemaphoreGiveFromISR(mem_semaphore, NULL);
-    }
-    mU1RXClearIntFlag();
-}
-
-void isr_cn() {
-    int send = 1;
-    xSemaphoreGiveFromISR(cn_semaphore, NULL);
-//    xQueueSendToBack(btn_queue, &send, 20);
-    mCNIntEnable(0);
-    mCNClearIntFlag();
-}
-
-static void mem_write() {
-    char inbox[80];
-    while(1) {
-        xSemaphoreTake(mem_semaphore, portMAX_DELAY);
-        //Disable interrupts
-        mU1RXIntEnable(0);
-        mCNIntEnable(0);
-        
-        #if ( configUSE_TRACE_FACILITY == 1 )
-            vTracePrint(write_trace, "String written to EEPROM");
-        #endif
-        
-        //Write to the EEPROM
-        int err = I2CWriteEEPROM(SLAVE_ADDRESS, MEM_ADDRESS[MESSAGE_COUNT], input_str, 80);
-        
-        //Enqueue the address
-        xQueueSendToBack(addr_queue, &MEM_ADDRESS[MESSAGE_COUNT], 20);
-        LATBSET = LEDA; //Reenable LEDA when write is complete.
-        int i;
-        for(i=0;i<80;i++) {
-            input_str[i] = '\0';
-        }
-        MESSAGE_COUNT++;
-        if(err != 0) LCD_puts("Error on EEPROM WRITE");
-        mU1RXIntEnable(1);
-        mCNIntEnable(1);
-    }
-}
-
-static void mem_read() {
-    char inbox[80];
-    int read_address;
-    int dummy;
-    while(1) {
-        xSemaphoreTake(cn_semaphore, portMAX_DELAY);
-//        xQueueReceive(btn_queue, &dummy, portMAX_DELAY);
-        if(MESSAGE_COUNT > 0) {
-            vTaskDelay(DEBOUNCE_TIME);
-            while((PORTG & BTN1) != 0);
-            vTaskDelay(DEBOUNCE_TIME);
-            xQueueReceive(addr_queue, &read_address, 20);
-            int i = 0;
-            for(i=0;i<80;i++) {
-                inbox[i] = '\0'; //Clear inbox values
-            }
-            int err = I2CReadEEPROM(SLAVE_ADDRESS, read_address, inbox, 80);
-            
-            #if ( configUSE_TRACE_FACILITY == 1 )
-                vTracePrint(read_trace, "String read from EEPROM");
-            #endif
-            
-            prettyPrint(inbox);
-            MESSAGE_COUNT--;
-        }
-        mCNClearIntFlag();
-        mCNIntEnable(1);
-    }
-}
-
-static void prettyPrint(char *input) {
-    int i,j;
-    char lines[12][16] = {'\0'};
-    int line_start = 0, line_end = 0;
-    int num_of_lines = 0;
-    
-    int edge = 15;
-    int end_flag = 0;
-    //Description of algorithm:
-    //look at the edge of our 16 character window.
-    //If it is a space or carriage return, commit that window to memory in the 2d array
-    //If it is a space or carriage return, set variables to indicate edge of window.
-    //if not, look a space to the left, and repeat.
-    for(i = edge; i >= 0; i--) {
-        if(input[i] == ' ' || input[i] == '\r') {
-            line_end = i;
-            int k = 0;
-            for(j = line_start;j<line_end;j++){
-                lines[num_of_lines][k] = input[j];
-                k++;
-            }
-            line_start = i;
-            num_of_lines++;
-            i = line_start + 16;
-            if(end_flag>0) break;
-            if(input[i] == '\0' || i > 80) end_flag++; //Detect the end of the input string
-        }
-    }
-    //scroll through the array
-    writeLCD(LCDIR,0x01); //Clear LCD?
-    PrintLineOne(lines[0]);
-    vTaskDelay(ONE_SEC);
-    if(num_of_lines > 1){
-        for(j=1;j <= num_of_lines; j++) {
-            writeLCD(LCDIR,0x01);
-            PrintLineOne(lines[j]);
-            PrintLineTwo(lines[j-1]);
-            vTaskDelay(ONE_SEC);
-        }
-    }
-    PrintLineTwo("                ");
-    vTaskDelay(ONE_SEC);
-}
-
-static void PrintLineOne(char *line) {
-    writeLCD(LCDIR,(0x40+0x80)); //Set address of cursor to 0x40
-    while(*line)
-    {
-        LCD_putc(*line);
-        *line++;
-    }
-}
-
-static void PrintLineTwo(char *line) {
-    writeLCD(LCDIR,0x80); // set address of cursor to 0x00
-    while(*line)
-    {
-        LCD_putc(*line);
-        *line++;
-    }
-}
 
 void vApplicationMallocFailedHook( void )
 {
@@ -293,8 +133,6 @@ void vApplicationMallocFailedHook( void )
 
 void vApplicationIdleHook( void )
 {
-    if(MESSAGE_COUNT == 0) LATBSET = LEDB;
-    else LATBCLR = LEDB;
 	/* vApplicationIdleHook() will only be called if configUSE_IDLE_HOOK is set
 	to 1 in FreeRTOSConfig.h.  It will be called on each iteration of the idle
 	task.  It is essential that code added to this hook function never attempts
