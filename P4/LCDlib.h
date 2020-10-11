@@ -10,3 +10,6 @@ void writeLCD(int addr, char c);
 char readLCD(int addr);
 void LCD_init();
 void hw_delay(unsigned int ms);
+void LCD_cursor_top();
+void LCD_cursor_bottom();
+void LCD_clear_line();

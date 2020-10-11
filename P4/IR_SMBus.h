@@ -4,5 +4,5 @@
 #define Fsck 50000
 #define BRG_VAL ((FPB/2/Fsck)-2)
 
-int init_I2C2(void);
-float readTemp(void);
+int init_I2C1(void);
+int readTemp(void);

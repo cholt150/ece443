@@ -50,6 +50,14 @@
       <itemPath>../comm.h</itemPath>
       <itemPath>../IR_SMBus.c</itemPath>
       <itemPath>../IR_SMBus.h</itemPath>
+      <itemPath>../ICapture.c</itemPath>
+      <itemPath>../ICapture.h</itemPath>
+      <itemPath>../PWM.c</itemPath>
+      <itemPath>../PWM.h</itemPath>
+      <itemPath>../isr_wrapper_cn.S</itemPath>
+      <itemPath>../CAN_P4.c</itemPath>
+      <itemPath>../CAN_P4.h</itemPath>
+      <itemPath>../GenericTypeDefs.h</itemPath>
     </logicalFolder>
     <logicalFolder name="ExternalFiles"
                    displayName="Important Files"

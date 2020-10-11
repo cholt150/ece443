@@ -80,8 +80,8 @@ void LCD_putc(char char_string)
 
 void LCD_puts(char *char_string)
 {
-    writeLCD(LCDIR,0x01);
-    writeLCD(LCDIR,0x02);
+//    writeLCD(LCDIR,0x01);
+//    writeLCD(LCDIR,0x02);
     while(*char_string)
     {
         
@@ -90,3 +90,17 @@ void LCD_puts(char *char_string)
     }
 }
 
+void LCD_cursor_top()
+{
+    writeLCD(LCDIR,0x80); // set address of cursor to 0x00
+}
+
+void LCD_cursor_bottom()
+{
+    writeLCD(LCDIR,(0x40+0x80)); //Set address of cursor to 0x40
+}
+
+void LCD_clear_line()
+{
+    LCD_puts("                ");
+}

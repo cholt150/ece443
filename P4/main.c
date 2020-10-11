@@ -11,6 +11,9 @@
 #include "CerebotMX7cK.h"
 #include "LCDlib.h"
 #include "IR_SMBus.h"
+#include "PWM.h"
+#include "ICapture.h"
+#include "CAN_P4.h"
 
 #define DEBOUNCE_TIME 20/portTICK_RATE_MS
 #define ONE_SEC 1000/portTICK_RATE_MS
@@ -18,61 +21,39 @@
 /*-----------------------------------------------------------*/
 
 /* Global Variables */
+int CONTROL_UNIT_STATE = 0;
+extern float motorSpeed;
+//Temp global variables to stand in for CAN
+
 
 /* FreeRTOS elements */
+xSemaphoreHandle cn_semaphore;
 
 /* Function Prototypes */
-static void prettyPrint(char* input);
-static void PrintLineOne(char *line);
-static void PrintLineTwo(char *line);
-static void prvSetupHardware( void );
-void isr_uart();
+static void prvSetupHardware();
 
 /* Task Prototypes  */
-static void heartbeat();
-static void mem_write();
-static void mem_read();
-//void __ISR(_UART1_VECTOR, IPL1) vUART_ISR_Wrapper(void);
-//void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
+static void control_unit();
+static void btn_handler();
+static void IO_unit();
+void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) vCN_ISR_Wrapper(void);
 
-    
-#if ( configUSE_TRACE_FACILITY == 1 )
-    traceString heartbeat_trace;
-    traceString uart_isr_trace;
-    traceString read_trace;
-    traceString write_trace;
-#endif
 
 int main( void )
 {   
-    
     prvSetupHardware();		/*  Configure hardware */
-    init_I2C2();
-    while(1) {
-        char str[16];
-        float F = readTemp();
-        sprintf(str, "Temp = %f", F);
-        LCD_puts(str);
-        hw_delay(1000);
-    }
     
-    #if ( configUSE_TRACE_FACILITY == 1 )
-        vTraceEnable(TRC_START); // Initialize and start recording
-        heartbeat_trace = xTraceRegisterString("heartbeat task");
-        uart_isr_trace = xTraceRegisterString("UART Interrupt");
-        write_trace = xTraceRegisterString("Message Written to EEPROM");
-        read_trace = xTraceRegisterString("Message Read from EEPROM");
-    #endif
-
-
+    /* Create Tasks */
+    xTaskCreate(control_unit, "control FSM", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    xTaskCreate(btn_handler, "btn_handler", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(IO_unit, "IO unit", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
     
-    LATBSET = LEDA; //Indicate that you can begin writing a message.
-
+    /* Create Semaphores */
+    cn_semaphore = xSemaphoreCreateBinary();
+    
     /*  Finally start the scheduler. */
     vTaskStartScheduler();
 
-/* Will only reach here if there is insufficient heap available to start
- *  the scheduler. */
     return 0;
 }  /* End of main */
 
@@ -83,28 +64,35 @@ static void prvSetupHardware( void )
     PORTSetPinsDigitalOut(IOPORT_B, SM_LEDS);
     LATBCLR = SM_LEDS;
     
+    PORTSetPinsDigitalOut(IOPORT_G, BRD_LEDS);
+    LATGCLR = BRD_LEDS;
+    
+    PORTSetPinsDigitalIn(IOPORT_G, BTN2);
+    unsigned int dummy = PORTReadBits(IOPORT_G, BTN2);
+    PORTSetPinsDigitalIn(IOPORT_A, BTN3);
+    dummy = PORTReadBits(IOPORT_A, BTN3);
     
     
     PMP_init();
     LCD_init();
     LCD_puts("LCD INITIALIZED");
     hw_delay(500);
-    init_I2C2();
+    init_I2C1();
     LCD_puts("I2C INITIALIZED");
     hw_delay(500);
-    initialize_uart1(19200, 1);
-    putsU1("UART INITIALIZED");
     
-    //UART Interrupt initialization
-    mU1RXIntEnable(1);
-    mU1SetIntPriority(1);
-    mU1SetIntSubPriority(0);
+    //Init motor modules
+    OutputCompareInit(0);
+    IC_init();
+    
+    CAN1Init();
+    CAN2Init();
     
     //BTN1 CN Int init.
 	mCNOpen(CN_ON, CN8_ENABLE, 0);
 	mCNSetIntPriority(2);
 	mCNSetIntSubPriority(0);
-	unsigned int dummy = PORTReadBits(IOPORT_G, BTN1);
+    dummy = PORTReadBits(IOPORT_G, BTN1);
 	mCNClearIntFlag();
 	mCNIntEnable(1);    
     
@@ -112,7 +100,151 @@ static void prvSetupHardware( void )
 }
 /*-----------------------------------------------------------*/
 
+void isr_cn() {
+    xSemaphoreGiveFromISR(cn_semaphore,NULL);
+    mCNIntEnable(0);
+    mCNClearIntFlag();
+}
 
+static void btn_handler() {
+    while(1) {
+        xSemaphoreTake(cn_semaphore, portMAX_DELAY);
+        if(CONTROL_UNIT_STATE == 0) {
+            CONTROL_UNIT_STATE = 1;
+        }
+        else {
+            CONTROL_UNIT_STATE = 0;
+        }
+        vTaskDelay(DEBOUNCE_TIME);
+        while((PORTG & BTN1) != 0);
+        vTaskDelay(DEBOUNCE_TIME);
+        mCNClearIntFlag();
+        mCNIntEnable(1);
+    }
+}
+
+static void control_unit() {
+    int IR_data = 0;
+    float RPS = 0;
+    int desired_PWM = 0;
+    int current_PWM = 0;
+    unsigned int t_start = ReadCoreTimer();; //holds timestamp of next update
+    char top_line[16];
+    char btm_line[16];
+    float temp = 0.0;
+    float lo = 0.0, hi = 0.0;
+    while(1) {
+        //Add CAN request
+        if((ReadCoreTimer() - t_start) > (CORE_MS_TICK_RATE * 2000)) {
+            CAN1TxSendMsg(1,0);//Send an RTR message
+            t_start = ReadCoreTimer();
+        }
+        //Receive the CAN sensor packet
+        // IR_data, RPS, current_PWM
+        CAN1RxMsgProcess(&IR_data, &RPS, &current_PWM);
+        //Sensor data to temperature
+        float K = IR_data * 0.02;
+        float C = K - 273.15;
+        temp = ((9.0/5.0) * C) + 32;
+        
+        switch (CONTROL_UNIT_STATE) {
+            case 0: //Configuration mode
+                LATGCLR = LED1;
+                
+                if((PORTG & BTN2) != 0) {
+                    hi = temp;
+                }
+                if((PORTA & BTN3) != 0) {
+                    lo = temp;
+                }
+                
+                writeLCD(LCDIR,0x01); //clears entire screen
+                
+                //Line formatting
+                sprintf(top_line, "      %2.1f       ", temp);
+                sprintf(btm_line, "%3.1f%12.1f", lo, hi);
+                
+                LCD_cursor_top();
+                LCD_puts(top_line);
+                LCD_cursor_bottom();
+                if(hi>lo) {
+                    LCD_puts(btm_line);
+                }
+                else {
+                    hi = lo = 0;
+                    LCD_clear_line();
+                }
+                
+                break;
+            case 1: //Operational mode
+                LATGSET = LED1;
+                
+                writeLCD(LCDIR,0x01); //clears entire screen
+                sprintf(top_line, "%2i%%%13.1f", current_PWM, RPS);
+                sprintf(btm_line, "%3.1f%6.1f%6.1f",lo,temp,hi);
+                
+                LCD_cursor_top();
+                LCD_puts(top_line);
+                LCD_cursor_bottom();
+                LCD_puts(btm_line);
+                
+//                top_line = {'\0'};
+//                btm_line = {'\0'};
+                
+                if(temp < lo) {
+                    desired_PWM = 20;
+                }
+                else if(temp > hi) {
+                    desired_PWM = 95;
+                }
+                else {
+                    float m = (85-30)/(hi-lo);
+                    float b = 30-(m*lo);
+                    desired_PWM = (m * temp) + b;
+                }
+                
+                CAN1TxSendMsg(0,desired_PWM);
+                
+                break;
+        }
+        vTaskDelay(ONE_SEC/2);
+    }
+}
+
+static void IO_unit() {
+    CANTxMessageBuffer * sensor_packet = CANGetTxMessageBuffer(CAN2,CAN_CHANNEL0);
+    int RPS;
+    int IR_data = 0;
+    int current_PWM;
+    int desired_PWM;
+    while(1) {
+        sensor_packet->messageWord[0] = 0;
+        sensor_packet->messageWord[1] = 0;
+        sensor_packet->messageWord[2] = 0;
+        sensor_packet->messageWord[3] = 0;
+        IR_data = readTemp();
+        
+        //Populate sensor packet.
+        sensor_packet->data[0] = IR_data & 0x00FF; //LSB
+        sensor_packet->data[1] = IR_data >> 8; //MSB
+        
+        RPS = (int)(motorSpeed * 100); //Upscale to preserve digits
+        sensor_packet->data[2] = RPS & 0x0000FF;
+        sensor_packet->data[3] = (RPS & 0x00FF00) >> 8;
+        sensor_packet->data[4] = (RPS & 0xFF0000) >> 16;
+        
+        sensor_packet->data[5] = current_PWM & 0x00FF;
+        sensor_packet->data[6] = current_PWM >> 8;
+        //Add
+        desired_PWM = CAN2RxMsgProcess(sensor_packet);
+        if(desired_PWM != 0) { //If the message was not an RTR
+            ChangeDuty(desired_PWM);
+            current_PWM = desired_PWM;
+        }
+        
+        vTaskDelay(ONE_SEC/2);
+    }
+}
 
 void vApplicationMallocFailedHook( void )
 {
